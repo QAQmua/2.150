@@ -1,0 +1,103 @@
+name: Build IPA (Direct Release)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    permissions:
+      contents: write 
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Xcode 环境
+        run: |
+          if [ -d "/Applications/Xcode_16.0.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_15.4.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          fi
+          xcodebuild -version
+
+      - name: 规整工程路径并清理多余配置
+        run: |
+          find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
+          TARGET_DIR=$(find . -name "Package.swift" -not -path "*/.*" -exec dirname {} \; | head -n 1)
+          if [ -z "$TARGET_DIR" ]; then
+            echo "❌ 未找到 Package.swift"
+            exit 1
+          fi
+          rm -rf AppSource
+          mv "$TARGET_DIR" AppSource
+          find AppSource -name "Assets.xcassets" | tail -n +2 | while read -r dup; do rm -rf "$dup"; done
+          sed -i '' 's/\.iOS("18.0")/\.iOS("17.0")/g' AppSource/Package.swift || true
+
+      - name: 自动剔除虚构的 iOS 26 报错语法
+        run: |
+          python3 -c "
+          import os, re
+          for root, _, files in os.walk('AppSource'):
+              for f in files:
+                  if f.endswith('.swift'):
+                      p = os.path.join(root, f)
+                      with open(p, 'r', encoding='utf-8') as file:
+                          txt = file.read()
+                      orig = txt
+                      txt = re.sub(r'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier \{[\s\S]*?body\(content: Content\) -> some View \{[\s\S]*?\}\s*\}', 'struct IOS26NativeBottomSafeAreaBar<BarContent: View>: ViewModifier {\n    @ViewBuilder let barContent: () -> BarContent\n    func body(content: Content) -> some View {\n        content.safeAreaInset(edge: .bottom) { barContent() }\n    }\n}', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*ToolbarItem\(placement: \.principal\)\s*\{\s*principalHeaderItem\s*\}\s*\.sharedBackgroundVisibility\(\.hidden\)\s*\}\s*else\s*\{', 'ToolbarItem(placement: .principal) { principalHeaderItem } //', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*namePill\s*\.glassEffect\([^)]*\)\s*\.padding\(\.top,\s*53\)\s*\}\s*else\s*\{', '{\n                        namePill.background(.regularMaterial, in: Capsule()).padding(.top, 53)', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*GlassEffectContainer[\s\S]*?\}\s*else\s*\{', '{', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*Color\.clear\.background\(Color\.black\.opacity\(0\.18\),\s*in:\s*shape\)\s*\.glassEffect\(\.clear,\s*in:\s*shape\)\s*\}\s*else\s*\{', '{\n', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*Color\.clear\.glassEffect\(\.clear,\s*in:\s*shape\)\s*\}\s*else\s*\{', '{\n', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*Color\.clear\s*\.background\(Color\(UIColor\.secondarySystemGroupedBackground\)\)\s*\.glassEffect\(\.regular\.interactive\(\),\s*in:\s*shape\)\s*\}\s*else\s*\{', '{\n', txt)
+                      txt = re.sub(r'if #available\(iOS 26\.0, \*\)\s*\{\s*Color\(UIColor\.tertiarySystemFill\)\.opacity\(0\.55\)\s*\.glassEffect\(\.clear,\s*in:\s*shape\)\s*\}\s*else\s*\{', '{\n', txt)
+                      if txt != orig:
+                          with open(p, 'w', encoding='utf-8') as file:
+                              file.write(txt)
+          "
+
+      - name: 执行编译与制作直装包
+        run: |
+          cd AppSource
+          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+          if [ -z "$SCHEME" ]; then SCHEME="AppModule"; fi
+          echo "编译 Scheme: $SCHEME"
+
+          xcodebuild build \
+            -scheme "$SCHEME" \
+            -destination "generic/platform=iOS" \
+            -configuration Release \
+            -derivedDataPath ./build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+          mkdir -p Payload
+          APP_PATH=$(find ./build -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ 未找到编译生成的 .app"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
+
+          PLIST_PATH=$(find Payload -name "Info.plist" | head -n 1)
+          if [ -f "$PLIST_PATH" ]; then
+            plutil -replace CFBundleIdentifier -string "com.youdong.app" "$PLIST_PATH"
+            plutil -replace CFBundleName -string "幼刀" "$PLIST_PATH" || true
+            plutil -replace CFBundleDisplayName -string "幼刀" "$PLIST_PATH" || true
+          fi
+
+          zip -qry output.ipa Payload
+          mv output.ipa "$GITHUB_WORKSPACE/YouDao.ipa"
+          echo "🎉 打包完成"
+
+      - name: 发布 Release 并提供 IPA 下载
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "幼刀 直装版 IPA (Build ${{ github.run_number }})"
+          files: YouDao.ipa
+          token: ${{ secrets.GITHUB_TOKEN }}
